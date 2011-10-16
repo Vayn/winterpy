@@ -2,7 +2,7 @@
 # vim:fileencoding=utf-8
 
 '''
-锁屏、设置 empathy 状态、etc
+锁屏、设置 im 状态、etc
 '''
 
 IDLE_TIME = 5 # 单位：分
@@ -38,20 +38,29 @@ def monitor_off():
   logging.debug('monitor off')
   return call(['xset', 'dpms', 'force', 'off'])
 
-def lockscreen():
+def lockscreen(type='g'):
   global screen_locked
-  st1 = call(['gnome-screensaver-command', '-l'])
+  if type == 'g':
+    st1 = call(['gnome-screensaver-command', '-l'])
+  else:
+    st1 = call(['xscreensaver-command', '-lock'])
   st2 = monitor_off()
   if not any((st1, st2)):
     screen_locked = True
 
-def empathy_leave(state):
+def im_leave(state, type='e'):
   global our_leave
   st = 1
   if state:
-    st = call(['setstatus', 'away', 'away from keyboard'])
+    if type == 'e':
+      st = call(['setstatus', 'away', 'away from keyboard'])
+    else:
+      st = call(['gajim-dbus', 'away', 'away from keyboard'])
   elif our_leave:
-    st = call(['setstatus', 'available'])
+    if type == 'e':
+      st = call(['setstatus', 'available'])
+    else:
+      st = call(['gajim-dbus', 'online'])
   if st == 0:
     our_leave = state
 
@@ -68,32 +77,32 @@ def main():
       req = os.read(fd, 1024)
       logging.debug('got request: %r', req)
       if req.strip() == b'lock':
-        lockscreen()
-        empathy_leave(True)
+        lockscreen(type='x')
+        im_leave(True, type='x')
       elif not req:
         os.close(fd)
         fd = os.open(FIFO, os.O_NONBLOCK | os.O_RDONLY)
     elif not screen_locked and d.idletime() > IDLE_TIME * 1000 * 60:
       logging.debug('idle, locking screen')
-      lockscreen()
-      empathy_leave(True)
-    elif screensaver_on():
-      # accidentally turned on, let's turn it off again
-      if screenon and d.idletime() > CHECK_INTERNAL * 1000:
-        logging.debug('timedout, turn off again')
-        d.key(66) # Escape
-        d.flush()
-        monitor_off()
-        timeout = CHECK_INTERNAL
-        screenon = False
-      else:
-        logging.debug('to be turned off if no action')
-        timeout = max(CHECK_INTERNAL - d.idletime() / 1000, 3)
-        screenon = True
+      lockscreen(type='x')
+      im_leave(True, type='x')
+    #elif screensaver_on():
+      ## accidentally turned on, let's turn it off again
+      #if screenon and d.idletime() > CHECK_INTERNAL * 1000:
+        #logging.debug('timedout, turn off again')
+        #d.key(66) # Escape
+        #d.flush()
+        #monitor_off()
+        #timeout = CHECK_INTERNAL
+        #screenon = False
+      #else:
+        #logging.debug('to be turned off if no action')
+        #timeout = max(CHECK_INTERNAL - d.idletime() / 1000, 3)
+        #screenon = True
     else:
       logging.debug('I\'m back')
       screen_locked = False
-      empathy_leave(False)
+      im_leave(False, type='x')
 
 if __name__ == '__main__':
   from pidfile import Daemonized
