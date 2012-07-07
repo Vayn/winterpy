@@ -10,10 +10,12 @@ import time
 import logging
 import http.client
 import traceback
+import tempfile
 from functools import partial
 
 from tornado.web import HTTPError, RequestHandler, asynchronous, GZipContentEncoding
 import tornado.escape
+import tornado.httpserver
 
 logger = logging.getLogger(__name__)
 _legal_range = re.compile(r'bytes=(\d*)-(\d*)$')
@@ -108,8 +110,11 @@ class StaticFileHandler(RequestHandler):
   _static_hashes = {}
   _lock = threading.Lock()  # protects _static_hashes
 
-  def initialize(self, path, default_filenames=None, dirindex=None):
-    self.root = os.path.abspath(path) + os.path.sep
+  def initialize(self, path=None, default_filenames=None, dirindex=None):
+    if path is not None:
+      self.root = os.path.abspath(path) + os.path.sep
+    else:
+      self.root = None
     self.default_filenames = default_filenames
     self.dirindex = dirindex
 
@@ -131,12 +136,14 @@ class StaticFileHandler(RequestHandler):
       raise HTTPError(403, "%s is not in root static directory", path)
     self.send_file(abspath, include_body)
 
-  def send_file(self, abspath, include_body=True, path=None):
+  def send_file(self, abspath, include_body=True, path=None, download=False):
     '''
     send a static file to client
 
     ``abspath``: the absolute path of the file on disk
     ``path``: the path to use as if requested, if given
+    ``download``: whether we should try to persuade the client to download the
+                  file. This can be either ``True`` or the intended filename
 
     If you use ``send_file`` directly and want to use another file as default
     index, you should set this parameter.
@@ -158,6 +165,7 @@ class StaticFileHandler(RequestHandler):
         self.redirect(redir, permanent=True)
         return
 
+      # check if we have a default available
       if self.default_filenames is not None:
         for i in self.default_filenames:
           abspath_ = os.path.join(abspath, i)
@@ -167,6 +175,7 @@ class StaticFileHandler(RequestHandler):
             break
 
       if not found:
+        # try dir listing
         if self.dirindex is not None:
           if not include_body:
             raise HTTPError(405)
@@ -175,10 +184,19 @@ class StaticFileHandler(RequestHandler):
         else:
           raise HTTPError(403, "Directory Listing Not Allowed")
 
-    if (not found and path.endswith('/')) or not os.path.exists(abspath):
+    if not os.path.exists(abspath):
+      # failed to figure out the file to send
       raise HTTPError(404)
     if not os.path.isfile(abspath):
       raise HTTPError(403, "%s is not a file" % self.request.path)
+
+    if download is not False:
+      if download is True:
+        filename = os.path.split(path)[1]
+      else:
+        filename = download
+      # See http://kb.mozillazine.org/Filenames_with_spaces_are_truncated_upon_download
+      self.set_header('Content-Disposition', 'attachment; filename="%s"' % filename.replace('"', r'\"'))
 
     self._send_file_async(path, abspath, include_body)
 
@@ -345,3 +363,167 @@ def apache_style_log(handler):
   f = handler.application.settings.get('log_file', sys.stderr)
   print(ip, '- -', dt, req, status, length, referrer, ua, file=f)
   f.flush()
+
+class HTTPConnection(tornado.httpserver.HTTPConnection):
+  _recv_a_time = 8192
+  def _on_headers(self, data):
+    try:
+      data = data.decode('latin1')
+      eol = data.find("\r\n")
+      start_line = data[:eol]
+      try:
+        method, uri, version = start_line.split(" ")
+      except ValueError:
+        raise tornado.httpserver._BadRequestException("Malformed HTTP request line")
+      if not version.startswith("HTTP/"):
+        raise tornado.httpserver._BadRequestException("Malformed HTTP version in HTTP Request-Line")
+      headers = tornado.httputil.HTTPHeaders.parse(data[eol:])
+      self._request = tornado.httpserver.HTTPRequest(
+        connection=self, method=method, uri=uri, version=version,
+        headers=headers, remote_ip=self.address[0])
+
+      content_length = headers.get("Content-Length")
+      if content_length:
+        content_length = int(content_length)
+        use_tmp_files = self._get_handler_info()
+        if not use_tmp_files and content_length > self.stream.max_buffer_size:
+          raise _BadRequestException("Content-Length too long")
+        if headers.get("Expect") == "100-continue":
+          self.stream.write(b"HTTP/1.1 100 (Continue)\r\n\r\n")
+        if use_tmp_files:
+          logging.debug('using temporary files for uploading')
+          self._receive_content(content_length)
+        else:
+          logging.debug('using memory for uploading')
+          self.stream.read_bytes(content_length, self._on_request_body)
+        return
+
+      self.request_callback(self._request)
+    except tornado.httpserver._BadRequestException as e:
+      logging.info("Malformed HTTP request from %s: %s",
+             self.address[0], e)
+      self.stream.close()
+      return
+
+  def _receive_content(self, content_length):
+    if self._request.method in ("POST", "PUT"):
+      content_type = self._request.headers.get("Content-Type", "")
+      if content_type.startswith("multipart/form-data"):
+        self._content_length_left = content_length
+        fields = content_type.split(";")
+        for field in fields:
+          k, sep, v = field.strip().partition("=")
+          if k == "boundary" and v:
+            if v.startswith('"') and v.endswith('"'):
+              v = v[1:-1]
+            self._boundary = b'--' + v.encode('latin1')
+            self._boundary_buffer = b''
+            self._boundary_len = len(self._boundary)
+            break
+        self.stream.read_until(b"\r\n\r\n", self._on_content_headers)
+      else:
+        self.stream.read_bytes(content_length, self._on_request_body)
+
+  def _on_content_headers(self, data, buf=b''):
+    self._content_length_left -= len(data)
+    data = self._boundary_buffer + data
+    logging.debug('file header is %r', data)
+    self._boundary_buffer = buf
+    header_data = data[self._boundary_len+2:].decode('utf-8')
+    headers = tornado.httputil.HTTPHeaders.parse(header_data)
+    disp_header = headers.get("Content-Disposition", "")
+    disposition, disp_params = tornado.httputil._parse_header(disp_header)
+    if disposition != "form-data":
+      logging.warning("Invalid multipart/form-data")
+      self._read_content_body(None)
+    if not disp_params.get("name"):
+      logging.warning("multipart/form-data value missing name")
+      self._read_content_body(None)
+    name = disp_params["name"]
+    if disp_params.get("filename"):
+      ctype = headers.get("Content-Type", "application/unknown")
+      fd, tmp_filename = tempfile.mkstemp(suffix='.tmp', prefix='tornado')
+      self._request.files.setdefault(name, []).append(
+        tornado.httputil.HTTPFile(
+          filename=disp_params['filename'],
+          tmp_filename=tmp_filename,
+          content_type=ctype,
+        )
+      )
+      self._read_content_body(os.fdopen(fd, 'wb'))
+    else:
+      logging.warning("multipart/form-data is not file upload, skipping...")
+      self._read_content_body(None)
+
+  def _read_content_body(self, fp):
+    self.stream.read_bytes(
+      min(self._recv_a_time, self._content_length_left),
+      partial(self._read_into, fp)
+    )
+
+  def _read_into(self, fp, data):
+    self._content_length_left -= len(data)
+    buf = self._boundary_buffer + data
+
+    bpos = buf.find(self._boundary)
+    if bpos != -1:
+      if fp:
+        fp.write(buf[:bpos-2])
+        fp.close()
+      spos = buf.find(b'\r\n\r\n', bpos)
+      if spos != -1:
+        self._boundary_buffer = buf[bpos:spos+4]
+        self._on_content_headers(b'', buf=buf[spos+4:])
+      elif self._content_length_left > 0:
+        self._boundary_buffer = buf[bpos:]
+        self.stream.read_until(b"\r\n\r\n", self._on_content_headers)
+      else:
+        del self._content_length_left
+        del self._boundary_buffer
+        del self._boundary_len
+        del self._boundary
+        self.request_callback(self._request)
+        return
+    else:
+      splitpos = -self._boundary_len-1
+      if fp:
+        fp.write(buf[:splitpos])
+      self._boundary_buffer = buf[splitpos:]
+      self._read_content_body(fp)
+
+  def _get_handler_info(self):
+    request = self._request
+    app = self.request_callback
+    handlers = app._get_host_handlers(request)
+    handler = None
+    for spec in handlers:
+      match = spec.regex.match(request.path)
+      if match:
+        handler = spec.handler_class(app, request, **spec.kwargs)
+        if spec.regex.groups:
+          # None-safe wrapper around url_unescape to handle
+          # unmatched optional groups correctly
+          def unquote(s):
+            if s is None:
+              return s
+            return tornado.escape.url_unescape(s, encoding=None)
+          # Pass matched groups to the handler.  Since
+          # match.groups() includes both named and unnamed groups,
+          # we want to use either groups or groupdict but not both.
+          # Note that args are passed as bytes so the handler can
+          # decide what encoding to use.
+
+          if spec.regex.groupindex:
+            kwargs = dict(
+              (str(k), unquote(v))
+              for (k, v) in match.groupdict().iteritems())
+          else:
+            args = [unquote(s) for s in match.groups()]
+        break
+    if handler:
+      return getattr(handler, 'use_tmp_files', False)
+
+class HTTPServer(tornado.httpserver.HTTPServer):
+  def handle_stream(self, stream, address):
+    HTTPConnection(stream, address, self.request_callback,
+                   self.no_keep_alive, self.xheaders)

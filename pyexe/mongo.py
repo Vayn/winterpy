@@ -9,6 +9,7 @@ from cli import repl
 from pprint import pprint
 import subprocess
 import datetime
+import argparse
 
 import locale
 locale.setlocale(locale.LC_ALL, '')
@@ -38,18 +39,23 @@ def displayfunc(value):
     pprint(value)
   v['_'] = value
 
-def main():
-  global db
-  conn = Connection(host=host, port=port)
+def main(kwargs):
+  global db, conn
+  conn = Connection(host=host, port=port, **kwargs)
   db = conn[db]
+
+  rc = os.path.expanduser('~/.mongorc.py')
+  if os.path.isfile(rc):
+    exec(compile(open(rc, 'rb').read(), '.mongorc.py', 'exec'))
 
   global v
   v = globals().copy()
   v.update(locals())
   v['_'] = None
-  del v['repl'], v['argv'], v['main'], v['host'], v['port']
+  del v['repl'], v['kwargs'], v['main'], v['host'], v['port']
   del v['displayfunc'], v['subprocess'], v['env']
   del v['__name__'], v['__cached__'], v['__doc__'], v['__file__'], v['__package__']
+  del v['rc'], v['argparse']
   sys.displayhook = displayfunc
 
   repl(
@@ -65,15 +71,21 @@ if __name__ == '__main__':
   except ImportError:
     pass
 
-  argv = sys.argv
-  if len(argv) == 2:
-    if '/' in argv[1]:
-      host, db = argv[1].split('/', 1)
+  parser = argparse.ArgumentParser(description='MongoDB Shell in Python')
+  parser.add_argument('--slaveok', action='store_true')
+  parser.add_argument('dburl', nargs='?', default=None,
+                      help='the database to use instead of localhost\'s test')
+  args = parser.parse_args()
+
+  kwargs = {}
+  if args.dburl:
+    dburl = args.dburl
+    if '/' in dburl:
+      host, db = dburl.split('/', 1)
     if ':' in host:
       host, port = host.split(':', 1)
-  elif len(argv) == 1:
-    pass
-  else:
-    sys.exit('argument error')
+      port = int(port)
+  if args.slaveok:
+    kwargs['slave_okay'] = True
 
-  main()
+  main(kwargs)
